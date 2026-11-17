@@ -1,0 +1,385 @@
+# Asen Share paketlerini bu (herkese açık) depoda derler ve yayımlar. Kaynak kod özel depodadır
+# (KAYNAK_DEPO); iş akışı onu salt okunur bir dağıtım anahtarıyla alır. Elle çalıştırılır:
+#
+#   gh workflow run derle.yml --repo asilozkryl/asen-share-releases -f ref=v0.3.0 -f yayimla=true
+#
+# - ref: kaynak depodaki etiket ya da dal. Yayın için sürüm etiketi (vX.Y.Z) olmalı ve
+#   app/src-tauri/tauri.conf.json'daki sürümle aynı olmalıdır.
+# - yayimla=false (varsayılan): deneme derlemesi. Release'e dokunulmaz; paketler iş akışı artefaktı
+#   olarak 3 gün kalır. Güncelleme imza anahtarı tanımlı değilse de çalışır.
+# - yayimla=true: macOS (.dmg + .app.tar.gz), Windows (NSIS .exe) ve Linux (.deb) paketleri bu deponun
+#   aynı adlı taslak release'ine yüklenir, latest.json imzalardan üretilir, taslak "en son sürüm" olarak
+#   yayımlanır ve yayındaki latest.json denetlenir. Taslak yayımlanana kadar kurulu uygulamalar önceki
+#   sürümü "en son" görür; yarım bir sürüm görünmez. Etiket zaten yayımlanmışsa iş akışı durur.
+#
+# Derleme adımları kaynak depodaki .github/workflows/release.yml ile aynıdır; orada değişen burada da
+# değiştirilmelidir. Bu depo herkese açık olduğu için:
+# - İş akışı yalnızca elle (workflow_dispatch) çalışır; çekme istekleri gizli değişkenlere erişemez.
+# - Derleme önbelleği kullanılmaz (önbellek, çatallardan gelen iş akışlarınca okunabilirdi).
+# - Derleme günlükleri herkese açıktır: derleyici uyarı ya da hata verirse ilgili kaynak satırları
+#   günlükte görünür.
+#
+# Gizli değişkenler (Settings → Secrets and variables → Actions):
+#   SOURCE_DEPLOY_KEY                   kaynak deponun salt okunur dağıtım anahtarının özel yarısı (zorunlu)
+#   TAURI_SIGNING_PRIVATE_KEY           `tauri signer generate` ile üretilen özel anahtar (yayın için zorunlu)
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  o anahtarın parolası
+# macOS imzası, isteğe bağlı:
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+# Sertifika yoksa macOS paketi ad-hoc imzalanır: çalışır, ama macOS izinleri her sürümde yeniden istenir.
+
+name: Derle ve yayımla
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Kaynak depodaki etiket ya da dal (yayın için vX.Y.Z)"
+        required: true
+        type: string
+      yayimla:
+        description: "Paketleri bu deponun release'ine yükle ve yayımla"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: derle-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  KAYNAK_DEPO: asilozkryl/asen-share
+  ETIKET: ${{ inputs.ref }}
+
+jobs:
+  surum-denetimi:
+    name: Sürüm denetimi
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kaynak depoyu al
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.KAYNAK_DEPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Etiket, tauri.conf.json sürümüyle aynı mı
+        env:
+          YAYIMLA: ${{ inputs.yayimla }}
+        run: |
+          surum="$(python3 -c 'import json; print(json.load(open("app/src-tauri/tauri.conf.json"))["version"])')"
+          echo "tauri.conf.json sürümü: $surum"
+          if [ "$YAYIMLA" = "true" ] && [ "$ETIKET" != "v$surum" ]; then
+            echo "::error::ref ($ETIKET), tauri.conf.json sürümüyle (v$surum) uyuşmuyor; yayın için sürüm etiketini verin."
+            exit 1
+          fi
+
+      - name: Güncelleme açık anahtarı ve gizli değişkenler
+        if: ${{ inputs.yayimla }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+        run: |
+          eksik=0
+          anahtar="$(python3 -c 'import json; print(json.load(open("app/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
+          if [ -z "$anahtar" ]; then
+            echo "::error::tauri.conf.json'da plugins.updater.pubkey boş; güncellemeler doğrulanamaz."
+            eksik=1
+          fi
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY gizli değişkeni bu depoda tanımlı değil; güncelleme paketleri imzalanamaz."
+            eksik=1
+          fi
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::APPLE_CERTIFICATE tanımlı değil: macOS paketi ad-hoc imzalanır, her güncellemede Ekran Kaydı ve Erişilebilirlik izinleri yeniden istenir."
+          fi
+          exit "$eksik"
+
+  taslak:
+    name: Taslak release
+    needs: surum-denetimi
+    if: ${{ inputs.yayimla }}
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.taslak.outputs.id }}
+    steps:
+      - name: Taslak release (varsa onu kullan)
+        id: taslak
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          satir="$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$ETIKET\") | \"\(.id) \(.draft)\"" | head -n 1)"
+          if [ -z "$satir" ]; then
+            id="$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$ETIKET" \
+              -f name="Asen Share $ETIKET" -F draft=true --jq .id)"
+            echo "Taslak açıldı: $id"
+          else
+            id="${satir%% *}"
+            if [ "${satir##* }" != "true" ]; then
+              echo "::error::$ETIKET bu depoda zaten yayımlanmış; yeni bir sürüm numarası kullanın ya da release'i taslağa çevirin."
+              exit 1
+            fi
+            echo "Var olan taslak kullanılıyor: $id"
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  paketle:
+    name: Paketle (${{ matrix.ad }})
+    needs: [surum-denetimi, taslak]
+    # Deneme derlemesinde taslak işi atlanır; paketleme yine çalışır.
+    if: ${{ !cancelled() && needs.surum-denetimi.result == 'success' && needs.taslak.result != 'failure' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ad: macOS (Apple Silicon)
+            runner: macos-latest
+            args: --target aarch64-apple-darwin
+            test_args: --target aarch64-apple-darwin
+          - ad: Windows (x64)
+            runner: windows-latest
+            args: ""
+            test_args: ""
+          - ad: Linux (x86_64)
+            runner: ubuntu-24.04
+            args: --bundles deb
+            test_args: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Kaynak depoyu al
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.KAYNAK_DEPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      # Üçüncü taraf action'lar commit SHA'sına sabitlenmiştir (etiket sonradan taşınabilir);
+      # SHA'lar kaynak depodaki release.yml ile aynı tutulur.
+      - name: Rust (kararlı)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable, 2026-10-16
+        with:
+          toolchain: stable
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin' || '' }}
+
+      # OpenH264 yedek kodlayıcısı nasm yoksa assembly'siz derlenir ve yazılım kodlaması yavaşlar.
+      - name: nasm (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+
+      - name: Linux derleme ve test bağımlılıkları
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libasound2-dev libdbus-1-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev nasm xvfb xauth
+
+      - name: Node 22
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Arayüz bağımlılıkları
+        working-directory: app
+        run: npm ci
+
+      # Sertifika, yalnızca bu iş için oluşturulan geçici bir anahtar zincirine alınır. Kendinden
+      # imzalı sertifika (ör. "Asen Share Dev") runner'ın sistem güven listesine de eklenir.
+      # Tauri, kimliği APPLE_SIGNING_IDENTITY'den okur ve anahtar zinciri arama listesinde bulur.
+      - name: macOS imza sertifikası
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          dizin="$(mktemp -d)"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$dizin/sertifika.p12"
+          zincir="$RUNNER_TEMP/asen-imza.keychain-db"
+          parola="$(openssl rand -hex 16)"
+          security create-keychain -p "$parola" "$zincir"
+          security set-keychain-settings -lut 21600 "$zincir"
+          security unlock-keychain -p "$parola" "$zincir"
+          security import "$dizin/sertifika.p12" -k "$zincir" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$parola" "$zincir" > /dev/null
+          security list-keychains -d user -s "$zincir" login.keychain-db
+          # /usr/bin/openssl (LibreSSL), Anahtar Zinciri Erişimi'nin eski biçimli .p12'sini de okur.
+          /usr/bin/openssl pkcs12 -in "$dizin/sertifika.p12" -clcerts -nokeys \
+            -passin "pass:$APPLE_CERTIFICATE_PASSWORD" -out "$dizin/sertifika.pem"
+          konu="$(/usr/bin/openssl x509 -in "$dizin/sertifika.pem" -noout -subject | sed 's/^subject= *//')"
+          veren="$(/usr/bin/openssl x509 -in "$dizin/sertifika.pem" -noout -issuer | sed 's/^issuer= *//')"
+          if [ "$konu" = "$veren" ]; then
+            echo "Kendinden imzalı sertifika: sistem güven listesine ekleniyor."
+            sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+              -k /Library/Keychains/System.keychain "$dizin/sertifika.pem"
+          fi
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            APPLE_SIGNING_IDENTITY="$(/usr/bin/openssl x509 -in "$dizin/sertifika.pem" -noout -subject \
+              -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p' | head -1)"
+          fi
+          rm -rf "$dizin"
+          echo "İmza kimliği: $APPLE_SIGNING_IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      # Boş değer "tanımlı" sayılır ve Tauri notarizasyonu denerdi; bu yüzden yalnızca varsa, bir
+      # sonraki (son) adıma GITHUB_ENV ile aktarılır. Değerler gizli olduğundan günlükte maskelenir.
+      - name: Notarizasyon bilgileri
+        if: runner.os == 'macOS' && env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          {
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
+
+      # Güncelleme artefaktları (.app.tar.gz, -setup.exe ve .sig'leri) yalnızca imza anahtarıyla
+      # üretilebilir; ana yapılandırmada kapalıdır (yerel derlemeler anahtarsız çalışsın diye).
+      - name: Güncelleme artefaktları
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "GUNCELLEME_ARGS=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_ENV"
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY tanımlı değil: güncelleme artefaktları üretilmez."
+          fi
+
+      # Yayında paketler bu depodaki taslağa yüklenir (latest.json'ı yayımla işi yazar).
+      - name: Derle ve paketle
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY || '-' }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: app
+          args: ${{ matrix.args }} ${{ env.GUNCELLEME_ARGS }}
+          releaseId: ${{ needs.taslak.outputs.id }}
+          uploadUpdaterJson: false
+
+      # Paketleme adımı güncelleme imzasını da doğrular; yerel updater testleri iki platformda
+      # geçmeden taslak yayımlanmaz. Release profili, paketlemede derlenen bağımlılıkları kullanır.
+      - name: Windows test ikilisinin manifest çalıştırıcısı
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $runnerScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/windows_test_runner.ps1'
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=pwsh -NoProfile -File $runnerScript" >> $env:GITHUB_ENV
+
+      - name: Linux ekran yakalama ve giriş testi
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum cargo test --release --locked -p asen-share-app --lib x11_capture_and_input -- --ignored
+
+      - name: Güncelleme servisinin yerel testleri
+        if: runner.os != 'Linux'
+        run: |
+          cargo test --release --locked -p asen-share-app updater:: --lib ${{ matrix.test_args }}
+
+      # Deneme derlemesinde (etiket yok) paketler iş akışı artefaktı olarak 3 gün saklanır. Hesabın
+      # artefakt depolama kotası doluysa yükleme başarısız olur ama iş başarısız sayılmaz; derleme
+      # yine de doğrulanmıştır. Release paketleri bu kotadan bağımsızdır.
+      - name: Paketleri artefakt olarak yükle (deneme derlemesi)
+        if: ${{ !inputs.yayimla }}
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v7.0.2
+        with:
+          name: asen-share-${{ runner.os }}
+          path: |
+            target/*/release/bundle/dmg/*.dmg
+            target/*/release/bundle/macos/*.app.tar.gz
+            target/*/release/bundle/macos/*.app.tar.gz.sig
+            target/release/bundle/nsis/*-setup.exe
+            target/release/bundle/nsis/*-setup.exe.sig
+            target/release/bundle/deb/*_amd64.deb
+          if-no-files-found: error
+          retention-days: 3
+
+  # latest.json bütün paketler yüklendikten sonra, tek yerde yazılır; taslak en son yayımlanır.
+  yayimla:
+    name: Yayımla
+    needs: [taslak, paketle]
+    if: ${{ inputs.yayimla }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kaynak depoyu al
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.KAYNAK_DEPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: latest.json betiğinin testleri
+        run: python3 -m unittest discover -s scripts -p 'test_latest_json.py' -v
+
+      - name: latest.json'ı üret ve taslağa yükle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.taslak.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" \
+            --jq 'any(.[]; (.name | endswith("_amd64.deb")) and .state == "uploaded")' | grep -qx true
+          python3 scripts/latest_json.py --repo "$GITHUB_REPOSITORY" --release-id "$ID" --tag "$ETIKET" --out latest.json
+          cat latest.json
+          # Yeniden çalıştırmada önceki latest.json silinir.
+          eski="$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets?per_page=100" --jq '.[] | select(.name == "latest.json") | .id')"
+          if [ -n "$eski" ]; then
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$eski"
+          fi
+          curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+            --data-binary @latest.json \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$ID/assets?name=latest.json" > /dev/null
+
+      # Taslağın notları elle yazılmışsa korunur; boşsa yalnızca kurulum bölümü yazılır.
+      - name: Yayımla
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.taslak.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/$ID" --jq '.body // ""' > notlar.md
+          if [ ! -s notlar.md ] || [ -z "$(tr -d '[:space:]' < notlar.md)" ]; then
+            cat <<'EOF' > notlar.md
+          ### Linux (x86_64)
+
+          Ubuntu 24.04 ve üzeri için `.deb` paketini indirin ve `sudo apt install ./Asen.Share_<sürüm>_amd64.deb` ile kurun. Komutta indirdiğiniz dosyanın adını kullanın.
+          EOF
+          fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$ID" -F draft=false -F prerelease=false \
+            -f make_latest=true -F body=@notlar.md > /dev/null
+          echo "Yayımlandı: https://github.com/$GITHUB_REPOSITORY/releases/tag/$ETIKET"
+
+      - name: Yayındaki latest.json'ı denetle
+        run: |
+          set -euo pipefail
+          for deneme in 1 2 3 4 5 6; do
+            if curl -sSfL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json" -o yayinda.json; then
+              break
+            fi
+            sleep 10
+          done
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          yayinda = json.load(open("yayinda.json"))
+          beklenen = os.environ["ETIKET"][1:]
+          if yayinda["version"] != beklenen:
+              sys.exit(f"latest.json sürümü {yayinda['version']}, beklenen {beklenen}")
+          for platform, paket in sorted(yayinda["platforms"].items()):
+              subprocess.run(["curl", "-sSfIL", "-o", "/dev/null", paket["url"]], check=True)
+              print(f"{platform}: {paket['url']} erişilebilir")
+          EOF
