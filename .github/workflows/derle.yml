@@ -23,8 +23,13 @@
 #   SOURCE_DEPLOY_KEY                   kaynak deponun salt okunur dağıtım anahtarının özel yarısı (zorunlu)
 #   TAURI_SIGNING_PRIVATE_KEY           `tauri signer generate` ile üretilen özel anahtar (yayın için zorunlu)
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  o anahtarın parolası
-# macOS imzası, isteğe bağlı:
-#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+# macOS imzası ve notarizasyon (kaynak depodaki README, "macOS imzası ve notarizasyon"):
+#   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD   Developer ID Application sertifikası (.p12, base64) ve parolası
+#   APPLE_SIGNING_IDENTITY                          isteğe bağlı; verilmezse sertifikanın adı (CN) kullanılır
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID         notarizasyon (Apple hesabı, uygulamaya özel parola, takım)
+# Paketleme bitince kaynak depodaki scripts/macos-verify-signature.sh .dmg'yi ve güncelleme paketini
+# denetler: notarizasyon bilgileri tanımlıysa paket notarize edilmiş ve bileti damgalanmış olmalıdır,
+# yalnızca sertifika tanımlıysa kalıcı bir kimlikle imzalı olmalıdır; tutmuyorsa iş durur.
 # Sertifika yoksa macOS paketi ad-hoc imzalanır: çalışır, ama macOS izinleri her sürümde yeniden istenir.
 
 name: Derle ve yayımla
@@ -82,6 +87,7 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
         run: |
           eksik=0
           anahtar="$(python3 -c 'import json; print(json.load(open("app/src-tauri/tauri.conf.json"))["plugins"]["updater"]["pubkey"])')"
@@ -95,6 +101,8 @@ jobs:
           fi
           if [ -z "$APPLE_CERTIFICATE" ]; then
             echo "::warning::APPLE_CERTIFICATE tanımlı değil: macOS paketi ad-hoc imzalanır, her güncellemede Ekran Kaydı ve Erişilebilirlik izinleri yeniden istenir."
+          elif [ -z "$APPLE_ID" ]; then
+            echo "::warning::APPLE_ID tanımlı değil: macOS paketi imzalanır ama notarize edilmez, Gatekeeper ilk kurulumda \"Yine de Aç\" ister."
           fi
           exit "$eksik"
 
@@ -270,6 +278,29 @@ jobs:
           args: ${{ matrix.args }} ${{ env.GUNCELLEME_ARGS }}
           releaseId: ${{ needs.taslak.outputs.id }}
           uploadUpdaterJson: false
+
+      # Tauri, notarizasyon bilgileri eksikse notarizasyonu yalnızca bir uyarıyla atlar. Kullanıcıya
+      # giden dosyalar (.dmg ve güncelleme paketi) burada denetlenir; beklenen düzey tutmuyorsa iş
+      # durur ve taslak yayımlanmaz. Düzey gizli değişkenlerden çıkar: notarizasyon bilgileri varsa
+      # "notarized", yalnızca sertifika varsa "signed", hiçbiri yoksa "any" (ad-hoc).
+      - name: macOS imzasını ve notarizasyonu doğrula
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          if [ ! -f scripts/macos-verify-signature.sh ]; then
+            echo "::warning::scripts/macos-verify-signature.sh bu sürümde yok; macOS imza denetimi atlandı."
+            exit 0
+          fi
+          beklenen=any
+          if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then beklenen=signed; fi
+          if [ -n "${APPLE_ID:-}" ]; then beklenen=notarized; fi
+          shopt -s nullglob
+          paketler=(target/*/release/bundle/dmg/*.dmg target/*/release/bundle/macos/*.app.tar.gz)
+          if [ "${#paketler[@]}" -eq 0 ]; then
+            echo "::error::Denetlenecek macOS paketi bulunamadı (target/*/release/bundle)."
+            exit 1
+          fi
+          bash scripts/macos-verify-signature.sh --expect "$beklenen" "${paketler[@]}"
 
       # Paketleme adımı güncelleme imzasını da doğrular; yerel updater testleri iki platformda
       # geçmeden taslak yayımlanmaz. Release profili, paketlemede derlenen bağımlılıkları kullanır.
